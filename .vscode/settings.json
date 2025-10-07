@@ -1,0 +1,9 @@
+{
+  "markdown-preview-enhanced.mathRenderingOption": "KaTeX",
+  "markdown-preview-enhanced.katexConfig": { "throwOnError": false },
+  "markdown-preview-enhanced.codeBlockTheme": "atom-one-light",
+  "markdown-preview-enhanced.enableCodeBlockTitle": false,
+  "editor.fontFamily": "'Noto Sans','Noto Sans Math','DejaVu Sans','Segoe UI Symbol', monospace",
+  "editor.wordWrap": "on",
+  "editor.tabSize": 2
+}

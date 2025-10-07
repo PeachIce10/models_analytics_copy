@@ -1,0 +1,186 @@
+title: Analytics Layout — How Existing Features Plug In
+summary: >
+  This page explains the final folder/file layout and exactly where logic from existing features
+  (product, cart, order, customer) is placed to run the models you select. It is layout-first:
+  which files own configuration, input reads, compute, validation, output writes, and serving
+  (gRPC/GraphQL). No implementation code here—just where things live and how they connect.
+
+layout:
+  root: analytics/
+  dirs:
+    - path: configs/
+      purpose: Central runtime configs:
+        - signals.yaml → serving backend per dataset (customer_segments, product_signals, affinity_edges)
+        - <model>.yaml → per-job inputs/outputs/time windows (e.g., customer_rfm.yaml)
+    - path: common/
+      purpose: Shared helpers used by jobs only
+      children:
+        - config/load.go        # read YAML files under analytics/configs
+        - datastore/postgres.go # query helpers to read inputs & write outputs (tables)
+        - datastore/clickhouse.go # query helpers for wide scans (inputs)
+        - timewin/window.go     # helpers for rolling windows (last_30d, last_90d)
+    - path: jobs/
+      purpose: Batch compute (one binary per model). Each job = cmd/ + pipeline/
+      note: Logic you add from existing features to fetch inputs lives in common/datastore/* and is used here.
+    - path: schemas/models/
+      purpose: JSON blueprints for output table shapes (docs/contracts; not runtime validation)
+    - path: signals/
+      purpose: Read-only serving slice that mirrors your feature pattern (models → services → validators → GraphQL → proto)
+      note: Reads Postgres/ClickHouse based on configs/signals.yaml; no compute here.
+
+models_jobs:  # where to place logic for each model
+  customer_rfm:
+    files:
+      - jobs/customer/rfm/cmd/main.go            # orchestrates: load configs → read inputs → run pipeline → upsert outputs
+      - jobs/customer/rfm/pipeline/customer_rfm_pipeline.go  # compute R/F/M + segment assignment
+      - jobs/customer/rfm/pipeline/customer_rfm_validate.go  # validate output rows before write
+      - configs/customer_rfm.yaml                 # choose input stores + output store/table + window + model_version
+    inputs_from_existing_features:
+      order: [user_id, total, created_at]        # add read helpers in common/datastore/{postgres,clickhouse}.go
+      customer: [user_id, created_at]            # add read helpers if needed
+    output_table:
+      name: customer_segments
+      schema_contract: schemas/models/customer_segments.schema.json
+      write_via: common/datastore/postgres.go    # upsert rows here (even if inputs came from CH)
+
+  product_velocity:
+    files:
+      - jobs/product/velocity/cmd/main.go
+      - jobs/product/velocity/pipeline/product_velocity_pipeline.go
+      - jobs/product/velocity/pipeline/product_velocity_validate.go
+      - configs/product_velocity.yaml
+    inputs_from_existing_features:
+      order: [product_id, count, created_at]
+    output_table:
+      name: product_signals
+      schema_contract: schemas/models/product_signals.schema.json
+      write_via: common/datastore/postgres.go
+
+  product_abcxyz:
+    files:
+      - jobs/product/abcxyz/cmd/main.go
+      - jobs/product/abcxyz/pipeline/product_abcxyz_pipeline.go
+      - jobs/product/abcxyz/pipeline/product_abcxyz_validate.go
+      - configs/product_abcxyz.yaml
+    inputs_from_existing_features:
+      order: [product_id, count, base_price, created_at]
+    output_table:
+      name: product_signals   # same table as velocity (shared surface)
+      schema_contract: schemas/models/product_signals.schema.json
+      write_via: common/datastore/postgres.go     # merge tags/abcxyz into same row by product_id
+
+  product_affinity:
+    files:
+      - jobs/product/affinity/cmd/main.go
+      - jobs/product/affinity/pipeline/product_affinity_pipeline.go
+      - jobs/product/affinity/pipeline/product_affinity_validate.go
+      - configs/product_affinity.yaml
+    inputs_from_existing_features:
+      order: [order_id, items{product_id, count}] # cart session adds optional enrichment if you ingest events
+    output_table:
+      name: affinity_edges
+      schema_contract: schemas/models/affinity_edges.schema.json
+      write_via: common/datastore/{postgres.go|clickhouse.go} # pick in config; table name is stable
+
+serving_signals:  # where to place logic to serve the model outputs
+  entrypoint:
+    - signals/cmd/main.go  # loads configs/signals.yaml, wires stores → services, starts gRPC/GraphQL
+
+  customer_segments:
+    files:
+      - signals/internal/models/customer_segment.go
+      - signals/internal/services/customer_signals_service.go
+      - signals/internal/validators/customer_signals_validator.go
+      - signals/internal/graph/schema/customer_signals.graphqls
+      - signals/internal/graph/schema/customer_signals.resolver.go
+      - signals/proto/customer_signals.proto
+    store_binding:
+      config_key: serving.customer_segments   # in configs/signals.yaml
+      choose_impl_in:
+        - signals/internal/store/factory.go
+        - signals/internal/store/postgres/customer_store_pg.go  # (exists)
+
+  product_signals:
+    files:
+      - signals/internal/models/product_signal.go
+      - signals/internal/services/product_signals_service.go
+      - signals/internal/validators/product_signals_validator.go
+      - signals/internal/graph/schema/product_signals.graphqls
+      - signals/internal/graph/schema/product_signals.resolver.go
+      - signals/proto/product_signals.proto
+    store_binding:
+      config_key: serving.product_signals
+      choose_impl_in:
+        - signals/internal/store/factory.go
+        - signals/internal/store/postgres/product_store_pg.go    # (exists)
+
+  affinity_edges:
+    files:
+      - signals/internal/models/affinity_edge.go
+      - signals/internal/services/affinity_signals_service.go
+      - signals/internal/validators/affinity_signals_validator.go
+      - signals/internal/graph/schema/affinity_signals.graphqls
+      - signals/internal/graph/schema/affinity_signals.resolver.go
+      - signals/proto/affinity_signals.proto
+    store_binding:
+      config_key: serving.affinity_edges
+      choose_impl_in:
+        - signals/internal/store/factory.go
+        - signals/internal/store/clickhouse/affinity_store_ch.go # (exists)
+
+how_existing_features_feed_models:  # where to put extraction logic; which IDs/metrics are used
+  product_feature:
+    ids: [product_id, variant_id, brand_id, category_id, sub_category_id]
+    metrics: [base_price, created_at]
+    extraction_location: common/datastore/{postgres.go,clickhouse.go}  # add read helpers used by jobs
+    used_by_jobs: [product_velocity, product_abcxyz, product_affinity]
+  cart_feature:
+    ids: [session_id, order_by(user_id)]
+    metrics: [items{product_id, variant_id, count}, added_at]
+    extraction_location: common/datastore/{postgres.go,clickhouse.go}  # if you ingest cart events
+    used_by_jobs: [product_affinity (optional enrichment)]
+  order_feature:
+    ids: [order_id, user_id]
+    metrics: [items{product_id, variant_id, count, base_price}, subtotal, total, created_at]
+    extraction_location: common/datastore/{postgres.go,clickhouse.go}
+    used_by_jobs: [customer_rfm, product_velocity, product_abcxyz, product_affinity]
+  customer_feature:
+    ids: [user_id]
+    metrics: [created_at]
+    extraction_location: common/datastore/{postgres.go}
+    used_by_jobs: [customer_rfm]
+
+data_flow_end_to_end:
+  steps:
+    - "Job loads configs/<model>.yaml via common/config/load.go"
+    - "Job reads inputs via common/datastore/{postgres,clickhouse}.go"
+    - "Job runs pipeline/*.go and validates outputs with *_validate.go"
+    - "Job upserts rows into output table (customer_segments | product_signals | affinity_edges)"
+    - "signals/cmd/main.go loads configs/signals.yaml and selects store impl per dataset"
+    - "signals/internal/services/* serve rows via gRPC (proto/*.proto) and GraphQL (graph/schema/*.graphqls)"
+
+contracts_and_ids:
+  canonical_ids:
+    product: product_id
+    variant: variant_id
+    brand: brand_id
+    category: category_id
+    sub_category: sub_category_id
+    customer: user_id
+    order: order_id
+  output_tables:
+    customer_segments: schemas/models/customer_segments.schema.json
+    product_signals:   schemas/models/product_signals.schema.json
+    affinity_edges:    schemas/models/affinity_edges.schema.json
+  keys_and_versioning:
+    - "Upsert keys include entity id + model_version + as_of to allow safe backfills"
+    - "IDs must be immutable; jobs never rewrite core feature data"
+
+authoring_checklist_for_new_model:
+  - "Create job skeleton under jobs/<domain>/<model>/{cmd, pipeline}"
+  - "Add inputs and output config under configs/<model>.yaml (choose stores)"
+  - "Add/extend read helpers in common/datastore/* for any new inputs"
+  - "Define or reuse an output table contract in schemas/models/*.json"
+  - "If you want it served, add signals files (model/service/validator/graphql/proto)"
+  - "Bind dataset → backend in configs/signals.yaml; keep only the needed store file (pg or ch)"
+

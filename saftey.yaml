@@ -1,0 +1,195 @@
+title: Analytics Reliability & Ops — Implementation Outline (Layout-Preserving)
+summary: >
+  This document explains exactly how to add health/safeguards/observability to the existing Analytics
+  layout without changing folders. It defines config keys, where logic lives in current files, what
+  gets checked at boot and daily, and how to surface status to a future Super Admin Ops panel via
+  the existing signals service (gRPC/GraphQL).
+
+scope:
+  goals:
+    - Catch misconfigurations at boot (fail fast).
+    - Detect stale/missing data early (freshness SLOs).
+    - Keep jobs idempotent and bounded (timeouts/retries).
+    - Expose a simple Ops status API for dashboards and alarms.
+  non_goals:
+    - No new directories; only edits to existing files.
+    - No runtime JSON-schema validation (schemas/ are docs-only).
+
+configs:
+  files:
+    - path: analytics/configs/signals.yaml
+      role: Serving SLOs + backend mapping per dataset.
+      keys:
+        serving:
+          customer_segments: { store: postgres, dsn_env: SIGNALS_PG_DSN }
+          product_signals:   { store: postgres, dsn_env: SIGNALS_PG_DSN }
+          affinity_edges:    { store: clickhouse, dsn_env: SIGNALS_CH_DSN }
+        slo:
+          freshness_hours:
+            customer_segments: 36
+            product_signals:   36
+            affinity_edges:    72
+          min_rows:
+            customer_segments: 1
+            product_signals:   1
+            affinity_edges:    1
+          timeouts_ms:
+            store_ping: 1500
+            request_default: 2000
+          paging:
+            max_limit: 200
+    - path: analytics/configs/customer_rfm.yaml
+      role: Job runtime bounds & IO selection.
+      keys:
+        inputs:
+          orders:    { store: postgres|clickhouse, dsn_env: CORE_PG_DSN|CORE_CH_DSN }
+          customers: { store: postgres, dsn_env: CORE_PG_DSN }
+        window: last_180d
+        output: { table: customer_segments, store: postgres, dsn_env: SIGNALS_PG_DSN }
+        model_version: rfm-1.0.0
+        job_slo:
+          max_runtime_sec: 900
+          max_retries: 2
+          backoff_sec: 30
+    - path: analytics/configs/product_velocity.yaml
+      role: Same pattern; define inputs/output + job_slo.
+    - path: analytics/configs/product_abcxyz.yaml
+      role: Same pattern; define inputs/output + job_slo.
+    - path: analytics/configs/product_affinity.yaml
+      role: Same pattern; define inputs/output + job_slo.
+
+service_boot_checks:
+  file: signals/internal/store/factory.go
+  responsibilities:
+    - Load analytics/configs/signals.yaml.
+    - Verify each dataset mapping has a matching store impl:
+      - postgres → *_store_pg.go
+      - clickhouse → *_store_ch.go
+    - Ping each backend with timeout (slo.timeouts_ms.store_ping).
+    - Check freshness & row count SLOs (slo.freshness_hours, slo.min_rows) via lightweight SELECTs.
+    - On any failure: return error → process exits (no partial boot).
+
+service_runtime:
+  entrypoint: signals/cmd/main.go
+  responsibilities:
+    - Read slo.timeouts_ms.request_default and apply as default per-request context timeout.
+    - Wire stores from factory and pass into:
+      - signals/internal/services/customer_signals_service.go
+      - signals/internal/services/product_signals_service.go
+      - signals/internal/services/affinity_signals_service.go
+    - Start servers and expose health:
+      http_health:
+        - /healthz : process up + store pings pass
+        - /readyz  : all boot checks passed + last freshness checks within SLO
+    - Log one line on boot with final bindings:
+      - customer_segments=postgres, product_signals=postgres, affinity_edges=clickhouse
+
+service_validators:
+  files:
+    - signals/internal/validators/customer_signals_validator.go
+    - signals/internal/validators/product_signals_validator.go
+    - signals/internal/validators/affinity_signals_validator.go
+  checks:
+    - Required IDs present.
+    - Enforce slo.paging.max_limit.
+    - Clamp numeric ranges (e.g., velocity filters) if you add them later.
+
+ops_api_for_dashboard:
+  add_graphql_types:
+    file: signals/internal/graph/schema/ops.graphqls
+    types:
+      - type OpsDatasetStatus { name: String!, store: String!, ok: Boolean!, rows: Int!, maxAgeHours: Int!, lastAsOf: Time, message: String }
+      - type OpsStatus { datasets: [OpsDatasetStatus!]!, startedAt: Time!, version: String! }
+    queries:
+      - extend type Query { opsStatus: OpsStatus! }
+  resolvers:
+    file: signals/internal/graph/schema/ops.resolver.go
+    sources:
+      - Read current bindings from factory (in-memory or injected).
+      - For each dataset, run COUNT + MAX(as_of) with short timeouts.
+      - Compare to slo.freshness_hours & slo.min_rows; set ok/message.
+  purpose:
+    - Power a Super Admin panel card with green/yellow/red statuses.
+    - Enable quick triage without shell access.
+
+jobs_safeguards:
+  per_job_entrypoint: jobs/<domain>/<model>/cmd/main.go
+  responsibilities:
+    - Load configs/<model>.yaml.
+    - Create context with deadline (job_slo.max_runtime_sec).
+    - Read inputs via common/datastore/{postgres.go,clickhouse.go}.
+    - Run pipeline/* and then *_validate.go checks:
+      - Required keys set (id, model_version, as_of).
+      - Non-negative numeric fields; dedupe on (id, model_version, as_of).
+    - Upsert outputs (Postgres recommended).
+    - Retries on transient failures (job_slo.max_retries, backoff).
+    - Exit non-zero on failure (external scheduler will alert/retry).
+
+common_datastore_contracts:
+  files:
+    - common/datastore/postgres.go
+    - common/datastore/clickhouse.go
+  musts:
+    - All queries accept context with deadlines.
+    - Short, bounded connection pools.
+    - Helpers: SelectFreshness(table), SelectCount(table), UpsertRows(table, rows).
+
+data_slo_definitions:
+  datasets:
+    - name: customer_segments
+      freshness_hours: use configs/signals.yaml (default 36)
+      min_rows:        use configs/signals.yaml (default 1)
+      as_of_field:     as_of
+    - name: product_signals
+      freshness_hours: use configs/signals.yaml
+      min_rows:        use configs/signals.yaml
+      as_of_field:     as_of
+    - name: affinity_edges
+      freshness_hours: use configs/signals.yaml (default 72 if clickhouse)
+      min_rows:        use configs/signals.yaml
+      as_of_field:     as_of
+
+alerts_and_reporting:
+  triggers:
+    - on_boot_failure: factory returns error → process never serves; external supervisor restarts & alerts.
+    - on_slo_breach: opsStatus shows ok=false → dashboard red state and page.
+  suggested_metrics:  # names only; emit however you prefer
+    - signals_boot_ok (gauge 0/1)
+    - signals_dataset_ok{dataset} (gauge)
+    - signals_dataset_rows{dataset} (gauge)
+    - signals_dataset_max_age_hours{dataset} (gauge)
+    - job_rows_written{job} (counter)
+    - job_runtime_seconds{job} (gauge or histogram)
+  minimum_logs:
+    - Boot line: bindings + freshness summary per dataset.
+    - Per-job completion: rows written, duration, window, model_version.
+
+admin_panel_wiring:
+  source: signals GraphQL → Query.opsStatus
+  widgets:
+    - “Datasets” table: name, store, rows, lastAsOf, maxAgeHours, status.
+    - “Recent jobs” (optional later): derive from logs or add a thin audit table.
+  actions:
+    - Link to configs/ (read-only) and model docs (schemas/models/*.json).
+
+ci_safeguards:
+  checks:
+    - Validate configs/signals.yaml is present and parseable.
+    - Ensure each serving.<dataset>.store has matching *_store_{pg|ch}.go file.
+    - Build signals (go build ./signals/cmd).
+  optional:
+    - Sample row validation against schemas/models/*.json during PRs (doc parity).
+
+runbooks:
+  boot_fails:
+    - Check signals.yaml → store mapping; ensure matching store file exists.
+    - Verify DSN env vars present and reachable.
+    - Inspect dataset SLOs vs actual last as_of.
+  stale_data:
+    - Inspect job logs and rerun affected job with the same configs window.
+    - Confirm output rows upserted; recheck opsStatus.
+
+final_notes:
+  - No new folders; everything above lives in the existing files/paths.
+  - Start with opsStatus GraphQL + boot fail-fast; add freshness/row checks next.
+  - Keep SLOs in configs/signals.yaml so operations never require code edits.
