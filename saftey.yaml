@@ -193,3 +193,6 @@ final_notes:
   - No new folders; everything above lives in the existing files/paths.
   - Start with opsStatus GraphQL + boot fail-fast; add freshness/row checks next.
   - Keep SLOs in configs/signals.yaml so operations never require code edits.
+
+
+
